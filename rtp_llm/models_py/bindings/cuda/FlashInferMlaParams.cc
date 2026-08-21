@@ -646,9 +646,10 @@ void FlashInferMlaAttnParams::fillParamsMhaDevice(torch::Tensor t_prefix_lengths
     // Exact page/token counts stay on device, so size for the worst case:
     // every batch fills its full page-table row. MIN_CACHE_PAGE_NUM prevents
     // allocator churn.
-    const int page_num_upper = batch_size * max_blocks_per_bs;
+    const int page_num_upper     = batch_size * max_blocks_per_bs;
+    const int total_input_tokens = t_input_lengths_dev.sum().item<int>();
     const int input_token_num_upper =
-        std::max(MIN_CACHE_INPUT_TOKEN_NUM, batch_size * max_blocks_per_bs * seq_size_per_block);
+        std::max({MIN_CACHE_INPUT_TOKEN_NUM, batch_size * max_blocks_per_bs * seq_size_per_block, total_input_tokens});
 
     // Reuse MLA-superset buffers to keep FlashInfer _paged_kv_* aliases stable.
     // Match fillParams' batch_reuse_info envelope so later graph replay does
@@ -660,8 +661,25 @@ void FlashInferMlaAttnParams::fillParamsMhaDevice(torch::Tensor t_prefix_lengths
                      /*batch_reuse_info_size=*/batch_size * 4,
                      forbid_realloc);
 
+    // Clamp input_lengths for the plan kernel to prevent block table OOB.
+    // The kernel computes: seq_len = input_len + prefix_len;
+    //                      pages_self = ceil(seq_len / page_size).
+    // pages_self must not exceed max_blocks_per_bs (block table column count).
+    // For SWA layers the block table is sized to sliding_window / page_size,
+    // so unclamped input_len would produce pages_self far exceeding the table width.
+    const int     max_seq_for_plan = max_blocks_per_bs * seq_size_per_block;
+    torch::Tensor t_input_lengths_for_plan;
+    if (t_prefix_lengths_dev.defined() && t_prefix_lengths_dev.numel() > 0) {
+        // Per-sample cap: input_len + prefix_len <= max_seq_for_plan
+        auto per_sample_max =
+            at::clamp_min(at::full_like(t_prefix_lengths_dev, max_seq_for_plan) - t_prefix_lengths_dev, 0);
+        t_input_lengths_for_plan = at::minimum(t_input_lengths_dev, per_sample_max);
+    } else {
+        t_input_lengths_for_plan = at::clamp_max(t_input_lengths_dev, max_seq_for_plan);
+    }
+
     cudaStream_t stream = GET_CURRENT_STREAM();
-    invokeMhaPagedAttnPlan(t_input_lengths_dev,
+    invokeMhaPagedAttnPlan(t_input_lengths_for_plan,
                            t_sequence_lengths_dev,
                            t_prefix_lengths_dev,
                            t_block_id_dev,
@@ -672,6 +690,36 @@ void FlashInferMlaAttnParams::fillParamsMhaDevice(torch::Tensor t_prefix_lengths
                            batch_indice_d,
                            positions_d,
                            stream);
+
+    // Re-fill positions_d with original (unclamped) input lengths for RoPE.
+    // The plan kernel only filled positions for clamped lengths; RoPE needs full sequence positions.
+    {
+        int clamped_sum = t_input_lengths_for_plan.sum().item<int>();
+        if (total_input_tokens > clamped_sum) {
+            auto    input_lens_cpu  = t_input_lengths_dev.cpu();
+            auto    prefix_lens_cpu = (t_prefix_lengths_dev.defined() && t_prefix_lengths_dev.numel() > 0) ?
+                                          t_prefix_lengths_dev.cpu() :
+                                          torch::zeros({batch_size}, torch::kInt32);
+            int64_t offset          = 0;
+            for (int64_t i = 0; i < batch_size; i++) {
+                int64_t orig_len  = input_lens_cpu[i].item<int64_t>();
+                int64_t prefix    = prefix_lens_cpu[i].item<int64_t>();
+                auto    pos_range = torch::arange(prefix, prefix + orig_len, positions_d.options());
+                positions_d.narrow(0, offset, orig_len).copy_(pos_range);
+                offset += orig_len;
+            }
+            // Update positions_d size to reflect the actual total token count
+            positions_d.unsafeGetTensorImpl()->set_sizes_contiguous({static_cast<int64_t>(total_input_tokens)});
+            // Also update batch_indice_d for the full token range
+            offset = 0;
+            for (int64_t i = 0; i < batch_size; i++) {
+                int64_t orig_len = input_lens_cpu[i].item<int64_t>();
+                batch_indice_d.narrow(0, offset, orig_len).fill_(static_cast<int32_t>(i));
+                offset += orig_len;
+            }
+            batch_indice_d.unsafeGetTensorImpl()->set_sizes_contiguous({static_cast<int64_t>(total_input_tokens)});
+        }
+    }
 
     // FlashInfer uses paged_kv_last_page_len/decode_page_indptr sizes;
     // page_indice may stay oversized. Consumers narrow batch_indice/positions

@@ -29,12 +29,12 @@ std::vector<T> toVec(const torch::Tensor& t) {
     return std::vector<T>(c.data_ptr<T>(), c.data_ptr<T>() + c.numel());
 }
 
-void fillScoreTokenIdsWithMemcpy(torch::Tensor&                     token_ids,
-                                 const std::vector<torch::Tensor>&  complete_token_ids,
-                                 const std::vector<int64_t>&        seq_lens,
-                                 int64_t                            score_len) {
-    int64_t batch_idx = 0;
-    auto*   dst       = token_ids.data_ptr<int32_t>();
+void fillScoreTokenIdsWithMemcpy(torch::Tensor&                    token_ids,
+                                 const std::vector<torch::Tensor>& complete_token_ids,
+                                 const std::vector<int64_t>&       seq_lens,
+                                 int64_t                           score_len) {
+    int64_t    batch_idx  = 0;
+    auto*      dst        = token_ids.data_ptr<int32_t>();
     const auto dst_stride = token_ids.size(1);
     for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
         auto* src     = complete_token_ids[stream_idx].data_ptr<int32_t>();
@@ -46,10 +46,10 @@ void fillScoreTokenIdsWithMemcpy(torch::Tensor&                     token_ids,
     }
 }
 
-void fillScoreTokenIdsWithTorchCopy(torch::Tensor&                     token_ids,
-                                    const std::vector<torch::Tensor>&  complete_token_ids,
-                                    const std::vector<int64_t>&        seq_lens,
-                                    int64_t                            score_len) {
+void fillScoreTokenIdsWithTorchCopy(torch::Tensor&                    token_ids,
+                                    const std::vector<torch::Tensor>& complete_token_ids,
+                                    const std::vector<int64_t>&       seq_lens,
+                                    int64_t                           score_len) {
     int64_t batch_idx = 0;
     for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
         auto seq_len = seq_lens[stream_idx];
@@ -155,12 +155,10 @@ TEST_F(MtpBatchStreamProcessorTest, DISABLED_benchmarkScoreTokenIdsTorchCopyVsMe
     fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len);
     ASSERT_TRUE(torch::equal(dst_memcpy, dst_torch));
 
-    auto memcpy_us =
-        benchmarkUs([&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); },
-                    iterations);
-    auto torch_us =
-        benchmarkUs([&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); },
-                    iterations);
+    auto memcpy_us = benchmarkUs(
+        [&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); }, iterations);
+    auto torch_us = benchmarkUs(
+        [&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); }, iterations);
 
     std::cout << "[mtp-score-token-ids-copy] streams=" << stream_count << " score_len=" << score_len
               << " max_seq_len=" << max_seq_len << " iterations=" << iterations << " memcpy_us=" << memcpy_us
@@ -201,9 +199,9 @@ TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputReplicatesScoreTok
     auto sampler_inputs_status = processor.gatherSpecSamplerInput(stream_groups, model_inputs, model_output);
     ASSERT_TRUE(sampler_inputs_status.ok());
 
-    auto token_ids = sampler_inputs_status.value().token_ids;
-    auto stride    = token_ids.size(1);
-    auto* data     = token_ids.data_ptr<int32_t>();
+    auto  token_ids = sampler_inputs_status.value().token_ids;
+    auto  stride    = token_ids.size(1);
+    auto* data      = token_ids.data_ptr<int32_t>();
 
     for (int64_t row = 0; row < 4; ++row) {
         EXPECT_EQ(5, data[row * stride]);
@@ -745,6 +743,43 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
     vector<int> expect_lm_output_indexes = {0, 1};
     EXPECT_TRUE(lm_output_indexes.is_cuda());
     EXPECT_EQ(expect_lm_output_indexes, toVec<int>(lm_output_indexes));
+
+    auto expect_positions =
+        [](const GptModelInputs& input, const vector<int>& expected_prefix, const vector<int>& expected_sequence) {
+            EXPECT_TRUE(input.prefix_lengths.is_cuda());
+            EXPECT_TRUE(input.sequence_lengths.is_cuda());
+            EXPECT_EQ(torch::kInt32, input.prefix_lengths.scalar_type());
+            EXPECT_EQ(torch::kInt32, input.sequence_lengths.scalar_type());
+            EXPECT_EQ(expected_prefix, toVec<int>(input.prefix_lengths));
+            EXPECT_EQ(expected_sequence, toVec<int>(input.sequence_lengths));
+            EXPECT_EQ(expected_sequence, toVec<int>(input.prefix_lengths + 1));
+        };
+    expect_positions(model_input, {1, 2}, {2, 3});
+
+    // Legacy GPU propose-token path receives the normal decode position.
+    stream1->getSPOutputBuffer()->propose_tokens_gpu = torch::tensor({{3}}, torch::kInt32).to(torch::kCUDA);
+    stream2->getSPOutputBuffer()->propose_tokens_gpu = torch::tensor({{1}}, torch::kInt32).to(torch::kCUDA);
+    model_input.sequence_lengths                     = torch::tensor({4, 5}, torch::kInt32);
+    processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
+
+    expect_positions(model_input, {4, 5}, {5, 6});
+
+    // Device state publishes the committed length, which is already the draft
+    // decode position and one greater than the target prefix.
+    GenerateStream::MtpAsyncDeviceState state1;
+    state1.propose_tokens_gpu = torch::tensor({{3}}, torch::kInt32).to(torch::kCUDA);
+    state1.next_seq_len_gpu   = torch::tensor({7}, torch::kInt32).to(torch::kCUDA);
+    stream1->setMtpAsyncDeviceState(std::move(state1));
+
+    GenerateStream::MtpAsyncDeviceState state2;
+    state2.propose_tokens_gpu = torch::tensor({{1}}, torch::kInt32).to(torch::kCUDA);
+    state2.next_seq_len_gpu   = torch::tensor({4}, torch::kInt32).to(torch::kCUDA);
+    stream2->setMtpAsyncDeviceState(std::move(state2));
+
+    model_input.sequence_lengths = torch::tensor({99, 99}, torch::kInt32);
+    processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
+
+    expect_positions(model_input, {6, 3}, {7, 4});
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInput) {

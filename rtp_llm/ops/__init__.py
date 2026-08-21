@@ -157,6 +157,7 @@ try:
         SpecialTokens,
         SpeculativeExecutionConfig,
         SpeculativeType,
+        SwaAttentionConfig,
         TaskType,
         VitConfig,
         VitSeparation,

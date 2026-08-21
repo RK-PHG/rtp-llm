@@ -24,6 +24,8 @@ void registerPyOpDefs(pybind11::module& m) {
         .def(pybind11::init<>())
         .def_readwrite("kv_cache_base", &LayerKVCache::kv_cache_base, "Key/value cache tensor (per-layer view)")
         .def_readwrite("kv_scale_base", &LayerKVCache::kv_scale_base, "Key/value cache scale tensor")
+        .def_readwrite("k_cache", &LayerKVCache::k_cache, "K cache view (valid when v_head_dim != head_dim)")
+        .def_readwrite("v_cache", &LayerKVCache::v_cache, "V cache view (valid when v_head_dim != head_dim)")
         .def_readonly("seq_size_per_block", &LayerKVCache::seq_size_per_block, "Sequence size per block")
         .def_readonly("layer_id", &LayerKVCache::layer_id, "Global layer id")
         .def_readonly("group_id", &LayerKVCache::group_id, "KV cache group id")
@@ -39,6 +41,10 @@ void registerPyOpDefs(pybind11::module& m) {
                        "Kernel block size (0 = same as seq_size_per_block)")
         .def_readwrite("num_kv_heads", &KVCache::num_kv_heads, "Number of KV heads per TP rank")
         .def_readwrite("head_dim", &KVCache::head_dim, "Head dimension")
+        .def_readwrite("v_head_dim", &KVCache::v_head_dim, "V head dimension (0 = same as head_dim)")
+        .def_readwrite("num_kv_heads_by_layer",
+                       &KVCache::num_kv_heads_by_layer,
+                       "Per-layer KV head num (empty = all layers use num_kv_heads)")
         .def_readwrite("use_mla", &KVCache::use_mla, "Whether MLA cache layout is used")
         .def_readwrite("kv_lora_rank", &KVCache::kv_lora_rank, "MLA KV LoRA rank")
         .def_readwrite("rope_head_dim", &KVCache::rope_head_dim, "MLA RoPE head dimension")

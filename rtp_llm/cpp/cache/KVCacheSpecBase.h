@@ -16,6 +16,7 @@ enum KVCacheSpecType {
     MultiHeadAttention,
     MultiHeadLatentAttention,
     LinearAttention,
+    SlidingWindowAttention
 };
 
 inline const char* KVCacheSpecTypeToString(KVCacheSpecType t) {

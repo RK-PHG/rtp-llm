@@ -25,21 +25,31 @@ public:
         const bool  is_hybrid = cache_config.groupNums() > 1;
         auto        layer_num = is_hybrid ? cache_config.group_layer_num : cache_config.layer_num;
         const auto& main_spec = cache_config.cache_specs[0];
-        // linear block size is same with full block block size
-        MemoryLayoutConfig main_layout = createMemoryLayoutConfig(is_hybrid,
-                                                                  layer_num,
-                                                                  cache_config.kv_block_stride_bytes,
-                                                                  cache_config.kv_scale_stride_bytes,
-                                                                  main_spec,
-                                                                  cache_config);
 
-        main_layout.kv_cache_offset_bytes = 0;
-        main_layout.kv_scale_offset_bytes = main_layout.kv_cache_offset_bytes + main_layout.kv_block_pool_size_bytes;
-        size_t current_offset             = main_layout.kv_scale_offset_bytes + main_layout.kv_scale_pool_size_bytes;
-        RTP_LLM_LOG_INFO("main_layout.kv_scale_offset_bytes: %zu", main_layout.kv_scale_offset_bytes);
-        RTP_LLM_LOG_INFO("main_layout.kv_scale_pool_size_bytes: %zu", main_layout.kv_scale_pool_size_bytes);
+        size_t current_offset = 0;
+        if (useDualStrideLayouts(cache_config)) {
+            // GA/SWA dual layout (e.g. MiMo V2.5): one layout per distinct stride, with
+            // an explicit mapping table for the interleaved layer distribution. Only
+            // reached when there is no LINEAR group.
+            current_offset = appendPerStrideLayouts(config, cache_config);
+        } else {
+            // linear block size is same with full block block size
+            MemoryLayoutConfig main_layout = createMemoryLayoutConfig(is_hybrid,
+                                                                      layer_num,
+                                                                      cache_config.kv_block_stride_bytes,
+                                                                      cache_config.kv_scale_stride_bytes,
+                                                                      main_spec,
+                                                                      cache_config);
 
-        config.memory_layouts.push_back(main_layout);
+            main_layout.kv_cache_offset_bytes = 0;
+            main_layout.kv_scale_offset_bytes =
+                main_layout.kv_cache_offset_bytes + main_layout.kv_block_pool_size_bytes;
+            current_offset = main_layout.kv_scale_offset_bytes + main_layout.kv_scale_pool_size_bytes;
+            RTP_LLM_LOG_INFO("main_layout.kv_scale_offset_bytes: %zu", main_layout.kv_scale_offset_bytes);
+            RTP_LLM_LOG_INFO("main_layout.kv_scale_pool_size_bytes: %zu", main_layout.kv_scale_pool_size_bytes);
+
+            config.memory_layouts.push_back(main_layout);
+        }
 
         // Create MTP sub-model layouts
         for (size_t i = 0; i < cache_config.mtp_sub_configs.size(); ++i) {
@@ -69,6 +79,15 @@ public:
                 current_offset += mtp_layout.kv_scale_pool_size_bytes;
             } else {
                 mtp_layout.kv_scale_offset_bytes = current_offset;
+            }
+
+            // When the explicit mapping is enabled, MTP layers keep the contiguous cursor
+            // semantics; append them to the mapping table to stay consistent
+            if (!config.explicit_layer_mapping.empty()) {
+                const int layout_idx = static_cast<int>(config.memory_layouts.size());
+                for (uint32_t local = 0; local < mtp_layer_num; ++local) {
+                    config.explicit_layer_mapping.emplace_back(layout_idx, static_cast<int>(local));
+                }
             }
 
             config.memory_layouts.push_back(mtp_layout);
@@ -168,6 +187,112 @@ public:
     }
 
 private:
+    // Whether to enable "one layout per stride class": hybrid, all groups are attention
+    // groups (no LINEAR), and the group strides are not all identical (e.g. MiMo
+    // GA 40960B / SWA 81920B). Existing models such as linear+full have a single stride
+    // and do not take this branch, so their behavior is unchanged.
+    //
+    // This branch gives the pool "one row per layer", so a single block id occupies a
+    // slot in every layer; the legacy branch allocates only group_layer_num rows shared
+    // across groups. The grouping granularity must follow whichever branch is taken,
+    // which is why HybridConfigCreator::usePerLayerRowLayout() duplicates the same
+    // predicate (it runs before grouping and has no fully-built CacheConfig available).
+    // Keep the two in sync when changing the condition here.
+    static bool useDualStrideLayouts(const CacheConfig& cache_config) {
+        if (cache_config.groupNums() <= 1
+            || cache_config.group_kv_block_stride_bytes.size() != cache_config.cache_specs.size()) {
+            return false;
+        }
+        for (const auto t : cache_config.group_types) {
+            if (t == CacheGroupType::LINEAR) {
+                return false;
+            }
+        }
+        size_t first = cache_config.group_kv_block_stride_bytes[0];
+        for (size_t s : cache_config.group_kv_block_stride_bytes) {
+            if (s != first) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Build one layout per stride class (preserving first-appearance order) and generate
+    // the explicit layer mapping. Returns the accumulated byte offset so that subsequent
+    // MTP layouts can keep appending.
+    static size_t appendPerStrideLayouts(BlockPoolConfig& config, const CacheConfig& cache_config) {
+        struct StrideClass {
+            size_t         kv_stride    = 0;
+            size_t         scale_stride = 0;
+            KVCacheSpecPtr spec;
+            uint32_t       layer_num = 0;
+        };
+        std::vector<StrideClass> classes;
+        std::vector<int>         group_to_class(cache_config.cache_specs.size(), -1);
+
+        for (size_t gid = 0; gid < cache_config.cache_specs.size(); ++gid) {
+            const auto&  spec         = cache_config.cache_specs[gid];
+            const size_t kv_stride    = cache_config.group_kv_block_stride_bytes[gid];
+            const size_t scale_stride = gid < cache_config.group_kv_scale_stride_bytes.size() ?
+                                            cache_config.group_kv_scale_stride_bytes[gid] :
+                                            spec->scale_block_size_bytes();
+            int          ci           = -1;
+            for (size_t c = 0; c < classes.size(); ++c) {
+                if (classes[c].kv_stride == kv_stride && classes[c].scale_stride == scale_stride) {
+                    ci = static_cast<int>(c);
+                    break;
+                }
+            }
+            if (ci < 0) {
+                ci = static_cast<int>(classes.size());
+                classes.push_back({kv_stride, scale_stride, spec, 0});
+            }
+            group_to_class[gid] = ci;
+            classes[static_cast<size_t>(ci)].layer_num +=
+                static_cast<uint32_t>(cache_config.global_layer_ids[gid].size());
+        }
+
+        size_t current_offset = 0;
+        for (size_t c = 0; c < classes.size(); ++c) {
+            MemoryLayoutConfig layout    = createMemoryLayoutConfig(/*enable_hybrid_attention=*/true,
+                                                                 classes[c].layer_num,
+                                                                 classes[c].kv_stride,
+                                                                 classes[c].scale_stride,
+                                                                 classes[c].spec,
+                                                                 cache_config);
+            layout.kv_cache_offset_bytes = current_offset;
+            current_offset += layout.kv_block_pool_size_bytes;
+            layout.kv_scale_offset_bytes = current_offset;
+            if (layout.hasScale()) {
+                current_offset += layout.kv_scale_pool_size_bytes;
+            }
+            RTP_LLM_LOG_INFO("per-stride layout[%zu]: layer_num=%u kv_stride=%zu scale_stride=%zu kv_off=%zu",
+                             c,
+                             classes[c].layer_num,
+                             classes[c].kv_stride,
+                             classes[c].scale_stride,
+                             layout.kv_cache_offset_bytes);
+            config.memory_layouts.push_back(layout);
+        }
+
+        // Explicit layer mapping: global_layer_id -> {layout_idx, local index within layout}
+        config.explicit_layer_mapping.assign(static_cast<size_t>(cache_config.layer_num), {-1, -1});
+        std::vector<int> class_cursor(classes.size(), 0);
+        for (size_t gid = 0; gid < cache_config.global_layer_ids.size(); ++gid) {
+            const int ci = group_to_class[gid];
+            for (int layer_id : cache_config.global_layer_ids[gid]) {
+                RTP_LLM_CHECK_WITH_INFO(layer_id >= 0
+                                            && static_cast<size_t>(layer_id) < config.explicit_layer_mapping.size(),
+                                        "layer_id %d out of range for explicit mapping (layer_num=%u)",
+                                        layer_id,
+                                        cache_config.layer_num);
+                config.explicit_layer_mapping[static_cast<size_t>(layer_id)] = {
+                    ci, class_cursor[static_cast<size_t>(ci)]++};
+            }
+        }
+        return current_offset;
+    }
+
     static MemoryLayoutConfig createMemoryLayoutConfig(bool           enable_hybrid_attention,
                                                        uint32_t       layer_num,
                                                        size_t         kv_block_stride_bytes,

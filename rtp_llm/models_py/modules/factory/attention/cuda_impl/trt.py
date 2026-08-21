@@ -47,6 +47,11 @@ class TRTMHAImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         # Create temporary instance to check support
         fmha_impl = TRTAttnOp(attn_configs)
         return fmha_impl.support(attn_inputs)
@@ -150,6 +155,11 @@ class TRTPagedMHAImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         # Create temporary instance to check support
         fmha_impl = TRTPagedAttnOp(attn_configs)
         return fmha_impl.support(attn_inputs)

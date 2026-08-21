@@ -12,7 +12,7 @@ from rtp_llm.config.quant_config import (
     W4a8Int4PerChannelQuantConfig,
     init_quant_config,
 )
-from rtp_llm.ops import DataType, KvCacheDataType
+from rtp_llm.ops import DataType, HybridAttentionType, KvCacheDataType
 from rtp_llm.ops import ModelConfig as CppModelConfig
 from rtp_llm.ops import TaskType
 from rtp_llm.utils.util import get_config_from_path, to_torch_dtype
@@ -256,14 +256,43 @@ class ModelConfig(CppModelConfig):
             if kv_cache_dtype_enum in [KvCacheDataType.FP8, KvCacheDataType.INT8]
             else 2
         )
-        kv_cache_size = (
-            2
-            * self.num_layers
-            * self.attn_config.kv_head_num
-            * self.attn_config.size_per_head
-            * kv_cache_bytes
-            * self.max_seq_len
-        )
+        if self.hybrid_attention_config.enable_hybrid_attention:
+            swa_cfg = self.hybrid_attention_config.swa_attention_config
+            pattern = self.hybrid_attention_config.hybrid_attention_types
+            ga_layers = sum(1 for t in pattern if t == HybridAttentionType.NONE)
+            swa_layers = sum(
+                1 for t in pattern if t == HybridAttentionType.SLIDING_WINDOW
+            )
+            v_head_size = (
+                self.attn_config.v_size_per_head
+                if self.attn_config.v_size_per_head > 0
+                else self.attn_config.size_per_head
+            )
+            # GA: K+V per token
+            ga_kv = (
+                ga_layers
+                * self.attn_config.kv_head_num
+                * (self.attn_config.size_per_head + v_head_size)
+            )
+            # SWA: K+V per token
+            swa_head = (
+                swa_cfg.swa_kv_head_num
+                if swa_cfg.swa_kv_head_num > 0
+                else self.attn_config.kv_head_num
+            )
+            swa_kv = (
+                swa_layers * swa_head * (self.attn_config.size_per_head + v_head_size)
+            )
+            kv_cache_size = (ga_kv + swa_kv) * kv_cache_bytes * self.max_seq_len
+        else:
+            kv_cache_size = (
+                2
+                * self.num_layers
+                * self.attn_config.kv_head_num
+                * self.attn_config.size_per_head
+                * kv_cache_bytes
+                * self.max_seq_len
+            )
         return kv_cache_size
 
     def _eval_runtime_buffer_mem_size(self) -> float:

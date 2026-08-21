@@ -202,11 +202,18 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams&          params,
         kv_cache.kernel_seq_size_per_block = params.kernel_tokens_per_block;
         const auto& layout                 = params.kv_cache_layer_layout.value();
         kv_cache.kv_cache_base_by_layer.reserve(layout.layers_to_kv_buffer_ptrs.size());
-        kv_cache.num_kv_heads  = params.description.attention_conf.kv_head_num;
-        kv_cache.head_dim      = params.description.attention_conf.size_per_head;
-        kv_cache.use_mla       = params.description.attention_conf.use_mla;
-        kv_cache.kv_lora_rank  = params.description.attention_conf.kv_lora_rank;
-        kv_cache.rope_head_dim = params.description.attention_conf.rope_head_dim;
+        kv_cache.num_kv_heads = params.description.attention_conf.kv_head_num;
+        kv_cache.head_dim     = params.description.attention_conf.size_per_head;
+        // K != V (MiMo V2.5 QK=192 / V=128): 0 means identical to head_dim; when
+        // asymmetric, getLayerCache uses this to split out separate k_cache/v_cache views
+        kv_cache.v_head_dim =
+            params.description.attention_conf.vSizePerHead() == params.description.attention_conf.size_per_head ?
+                0 :
+                static_cast<int>(params.description.attention_conf.vSizePerHead());
+        kv_cache.num_kv_heads_by_layer = layout.layer_local_kv_head_num;
+        kv_cache.use_mla               = params.description.attention_conf.use_mla;
+        kv_cache.kv_lora_rank          = params.description.attention_conf.kv_lora_rank;
+        kv_cache.rope_head_dim         = params.description.attention_conf.rope_head_dim;
         for (const auto& t : layout.layers_to_kv_buffer_ptrs) {
             kv_cache.kv_cache_base_by_layer.push_back(t);
         }

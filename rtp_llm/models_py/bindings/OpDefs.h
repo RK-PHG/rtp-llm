@@ -24,8 +24,12 @@ namespace torch_ext {
 //   MHA: [kernel_block_num, 2, num_kv_heads, kernel_seq_size_per_block, head_dim]
 //   MLA: [kernel_block_num, kernel_seq_size_per_block, kv_lora_rank + rope_head_dim]
 struct LayerKVCache {
-    torch::Tensor              kv_cache_base;
-    torch::Tensor              kv_scale_base;
+    torch::Tensor kv_cache_base;
+    torch::Tensor kv_scale_base;
+    // Valid when K != V (v_head_dim != head_dim, e.g. MiMo V2.5 QK=192 / V=128):
+    // narrow views into the interleaved [P, H, N, K_dim+V_dim] layout, with identical strides
+    torch::Tensor              k_cache;
+    torch::Tensor              v_cache;
     int                        seq_size_per_block = 0;
     int                        layer_id           = -1;
     int                        group_id           = -1;
@@ -42,9 +46,11 @@ struct KVCache {
     int                        kernel_seq_size_per_block = 0;
     int                        num_kv_heads              = 0;
     int                        head_dim                  = 0;
-    bool                       use_mla                   = false;
-    int                        kv_lora_rank              = 0;
-    int                        rope_head_dim             = 0;
+    int                        v_head_dim                = 0;  // 0 = identical to head_dim
+    std::vector<int>           num_kv_heads_by_layer;          // empty = all layers use num_kv_heads
+    bool                       use_mla       = false;
+    int                        kv_lora_rank  = 0;
+    int                        rope_head_dim = 0;
 
     // Per-layer attention type (CacheGroupType::FULL or LINEAR).
     std::vector<rtp_llm::CacheGroupType>    layer_group_types;
@@ -95,8 +101,47 @@ struct KVCache {
                     layer_cache.kv_cache_base = base.reshape({kernel_block_num,
                                                               (int64_t)kernel_seq_size_per_block,
                                                               (int64_t)(kv_lora_rank + rope_head_dim)});
+                } else if (v_head_dim > 0 && v_head_dim != head_dim && head_dim > 0 && num_kv_heads > 0) {
+                    // Asymmetric K/V (MiMo V2.5): a block stores K first then V, so split
+                    // into two views by element offset; the per-layer kv head count comes
+                    // from num_kv_heads_by_layer (GA=4 / SWA=8)
+                    const int64_t heads = (static_cast<size_t>(idx) < num_kv_heads_by_layer.size()
+                                           && num_kv_heads_by_layer[static_cast<size_t>(idx)] > 0) ?
+                                              num_kv_heads_by_layer[static_cast<size_t>(idx)] :
+                                              num_kv_heads;
+                    const int64_t page = kernel_seq_size_per_block > 0 ? kernel_seq_size_per_block : seq_size_per_block;
+                    // A physical block stores [H][N][K_dim+V_dim]. Splitting N into
+                    // kernel blocks moves the token axis above the head axis, so the
+                    // reshape below still matches memory only when there is nothing
+                    // between the block axis and the token axis (heads == 1). With
+                    // heads > 1 it silently transposes head and token strides, which
+                    // reads valid-looking garbage instead of failing.
+                    if (kernel_blocks_per_kv_block != 1 && heads != 1) {
+                        throw std::runtime_error("asymmetric K/V cache cannot be viewed at kernel-block granularity: "
+                                                 "kernel_blocks_per_kv_block="
+                                                 + std::to_string(kernel_blocks_per_kv_block) + " with num_kv_heads="
+                                                 + std::to_string(heads) + " (layer " + std::to_string(idx)
+                                                 + "); set kernel_seq_size_per_block == seq_size_per_block");
+                    }
+                    // Interleaved layout: reshape to [P, H, N, K_dim+V_dim], then slice last dim.
+                    // This gives k_cache and v_cache identical strides, satisfying FlashInfer's
+                    // paged kernel requirement (stride must be the same for both K and V).
+                    auto pool = base.reshape({kernel_block_num, heads, page, (int64_t)head_dim + (int64_t)v_head_dim});
+                    layer_cache.k_cache       = pool.narrow(3, 0, (int64_t)head_dim);
+                    layer_cache.v_cache       = pool.narrow(3, (int64_t)head_dim, (int64_t)v_head_dim);
+                    layer_cache.kv_cache_base = base;  // keep the raw view available
                 } else if (num_kv_heads > 0 && head_dim > 0) {
                     // MHA layout: [kernel_block_num, 2, num_kv_heads, kernel_seq_size_per_block, head_dim]
+                    // A physical block stores [2][H][N][D]; the leading K/V axis sits
+                    // between the block axis and the token axis, so splitting N into
+                    // kernel blocks can never match memory here — it would transpose
+                    // the K/V and head strides and read valid-looking garbage.
+                    if (kernel_blocks_per_kv_block != 1) {
+                        throw std::runtime_error(
+                            "MHA cache cannot be viewed at kernel-block granularity: kernel_blocks_per_kv_block="
+                            + std::to_string(kernel_blocks_per_kv_block) + " (layer " + std::to_string(idx)
+                            + "); set kernel_seq_size_per_block == seq_size_per_block");
+                    }
                     layer_cache.kv_cache_base = base.reshape({kernel_block_num,
                                                               2,
                                                               (int64_t)num_kv_heads,
@@ -171,14 +216,14 @@ struct KVCache {
         }
 
         LayerKVCache layer_cache;
-        layer_cache.layer_id      = idx;
-        layer_cache.group_id      = layer_region_to_group_id.empty() ? -1 : layer_region_to_group_id[layer][attn];
-        layer_cache.region_name   = region_name;
-        const bool is_full_region = !rtp_llm::isDsv4FixedRegion(region_name);
-        layer_cache.seq_size_per_block =
-            is_full_region && kernel_seq_size_per_block > 0 ? kernel_seq_size_per_block :
-                                                              groupSeqSizePerBlock(layer_cache.group_id);
-        layer_cache.kv_cache_base = base;
+        layer_cache.layer_id           = idx;
+        layer_cache.group_id           = layer_region_to_group_id.empty() ? -1 : layer_region_to_group_id[layer][attn];
+        layer_cache.region_name        = region_name;
+        const bool is_full_region      = !rtp_llm::isDsv4FixedRegion(region_name);
+        layer_cache.seq_size_per_block = is_full_region && kernel_seq_size_per_block > 0 ?
+                                             kernel_seq_size_per_block :
+                                             groupSeqSizePerBlock(layer_cache.group_id);
+        layer_cache.kv_cache_base      = base;
         if (!kv_scale_base_by_layer_region.empty() && layer < kv_scale_base_by_layer_region.size()
             && attn < kv_scale_base_by_layer_region[layer].size()) {
             layer_cache.kv_scale_base = kv_scale_base_by_layer_region[layer][attn];

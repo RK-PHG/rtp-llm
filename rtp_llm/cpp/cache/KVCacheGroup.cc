@@ -25,6 +25,22 @@ bool KVCacheGroup::init() {
         // - For hybrid layout, BlockPool exposes per-group "physical layer slot" tensors sized by
         //   CacheConfig.group_layer_num, while layer_ids_ still stores global model layer ids.
         //   In that case, we must bind global_layer_id -> layer_tensors[local_slot=i].
+        // - For hybrid dual-layout with explicit layer mapping (MiMo V2.5 interleaved GA/SWA),
+        //   BlockPool indexes both tensors and addresses by global layer id, so pass the
+        //   global layer id straight through.
+
+        if (block_pool_->hasExplicitLayerMapping()) {
+            RTP_LLM_CHECK_WITH_INFO(global_layer_id >= 0 && static_cast<size_t>(global_layer_id) < layer_tensors.size(),
+                                    "global_layer_id %d out of range (layer_tensors=%zu)",
+                                    global_layer_id,
+                                    layer_tensors.size());
+            global_layer_to_kv_tensors[global_layer_id] = layer_tensors[static_cast<size_t>(global_layer_id)];
+            if (!scale_tensors.empty()) {
+                global_layer_to_kv_scale_tensors[global_layer_id] = scale_tensors[static_cast<size_t>(global_layer_id)];
+            }
+            global_layer_to_local_layer[global_layer_id] = global_layer_id;
+            continue;
+        }
 
         global_layer_to_kv_tensors[global_layer_id] = layer_tensors[static_cast<size_t>(i)];
 

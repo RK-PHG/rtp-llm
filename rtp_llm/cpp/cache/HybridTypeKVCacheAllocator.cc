@@ -55,16 +55,35 @@ bool HybridTypeKVCacheAllocator::doInit() {
             full_group_ids_.push_back(gid);
         }
 
+        // A sliding-window group's block list is capped at the ring size, so its
+        // per-request footprint no longer tracks the sequence length.
+        if (static_cast<size_t>(gid) < config_.group_ring_blocks.size()
+            && config_.group_ring_blocks[static_cast<size_t>(gid)] > 0) {
+            group->setRingBlocks(static_cast<int>(config_.group_ring_blocks[static_cast<size_t>(gid)]));
+            RTP_LLM_LOG_INFO("cache group %d is a sliding-window ring of %u blocks",
+                             gid,
+                             config_.group_ring_blocks[static_cast<size_t>(gid)]);
+        }
+
         RTP_LLM_CHECK_WITH_INFO(group->init(), "Failed to initialize KVCacheGroup gid %d", gid);
         kv_cache_groups_.push_back(group);
     }
 
     global_layer_to_local_id_.assign(static_cast<size_t>(config_.layer_all_num), -1);
-    for (const auto& cur_group_layers : layer_groups) {
-        for (size_t local_layer_idx = 0; local_layer_idx < cur_group_layers.size(); ++local_layer_idx) {
-            const int global_layer_idx = cur_group_layers[local_layer_idx];
-            if (global_layer_idx >= 0 && static_cast<size_t>(global_layer_idx) < global_layer_to_local_id_.size()) {
-                global_layer_to_local_id_[static_cast<size_t>(global_layer_idx)] = static_cast<int>(local_layer_idx);
+    if (block_pool_->hasExplicitLayerMapping()) {
+        // Dual-layout explicit mapping (MiMo V2.5): BlockPool indexes by global layer id,
+        // so use an identity mapping here
+        for (size_t l = 0; l < global_layer_to_local_id_.size(); ++l) {
+            global_layer_to_local_id_[l] = static_cast<int>(l);
+        }
+    } else {
+        for (const auto& cur_group_layers : layer_groups) {
+            for (size_t local_layer_idx = 0; local_layer_idx < cur_group_layers.size(); ++local_layer_idx) {
+                const int global_layer_idx = cur_group_layers[local_layer_idx];
+                if (global_layer_idx >= 0 && static_cast<size_t>(global_layer_idx) < global_layer_to_local_id_.size()) {
+                    global_layer_to_local_id_[static_cast<size_t>(global_layer_idx)] =
+                        static_cast<int>(local_layer_idx);
+                }
             }
         }
     }
@@ -101,6 +120,19 @@ CacheLayerLayout HybridTypeKVCacheAllocator::allLayerCacheBase() const {
     layout.layer_to_groups = layer_to_group_id_;
     layout.layers_to_kv_buffer_ptrs.resize(config_.layer_all_num);
     layout.layers_to_scale_buffer_ptrs.resize(config_.layer_all_num);
+
+    // Per-layer kv head num on this rank (downstream needs per-layer values when GA/SWA
+    // are heterogeneous, e.g. MiMo V2.5)
+    layout.layer_local_kv_head_num.assign(config_.layer_all_num, 0);
+    for (size_t layer_id = 0; layer_id < static_cast<size_t>(config_.layer_all_num); ++layer_id) {
+        if (layer_id < config_.layer_to_group_id.size()) {
+            const int gid = config_.layer_to_group_id[layer_id];
+            if (gid >= 0 && static_cast<size_t>(gid) < config_.cache_specs.size() && config_.cache_specs[gid]) {
+                layout.layer_local_kv_head_num[layer_id] =
+                    static_cast<int>(config_.cache_specs[static_cast<size_t>(gid)]->local_head_num_kv);
+            }
+        }
+    }
 
     for (size_t layer_id = 0; layer_id < static_cast<size_t>(config_.layer_all_num); ++layer_id) {
         int32_t      local     = global_layer_to_local_id_[layer_id];

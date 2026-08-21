@@ -41,6 +41,8 @@ class MhaRotaryEmbeddingOp(BaseRotaryEmbeddingOp):
         )
         self.num_heads = attn_config.head_num
         self.num_kv_heads = attn_config.kv_head_num
+        self.head_size = attn_config.size_per_head
+        self.v_head_size = attn_config.v_size_per_head or attn_config.size_per_head
         self.seq_size_per_block = attn_config.kernel_tokens_per_block
         self.params = None
 
@@ -69,19 +71,21 @@ class MhaRotaryEmbeddingOp(BaseRotaryEmbeddingOp):
         # Split QKV tensor into Q, K, V
         # qkv shape: [total_tokens, (num_heads + 2*num_kv_heads) * head_dim]
         qkv = qkv.reshape(qkv.shape[0], -1)
+        split_sizes = [
+            self.head_size * self.num_heads,
+            self.head_size * self.num_kv_heads,
+            self.v_head_size * self.num_kv_heads,
+        ]
+
         q, k, v = torch.split(
             qkv,
-            [
-                self.head_size * self.num_heads,
-                self.head_size * self.num_kv_heads,
-                self.head_size * self.num_kv_heads,
-            ],
+            split_sizes,
             dim=-1,
         )
         # Reshape to [total_tokens, num_heads, head_dim]
         query = q.reshape(q.shape[0], self.num_heads, self.head_size)
         key = k.reshape(k.shape[0], self.num_kv_heads, self.head_size)
-        value = v.reshape(v.shape[0], self.num_kv_heads, self.head_size)
+        value = v.reshape(v.shape[0], self.num_kv_heads, self.v_head_size)
 
         # Apply RoPE to Q and K
         self._apply_rope(query, key, self.params)

@@ -103,6 +103,7 @@ class ArpcConfig:
 
 
 class AttentionConfigs:
+    add_sink_bias: bool
     dtype: torch.dtype
     fuse_qkv_add_bias: bool
     head_num: int
@@ -128,6 +129,8 @@ class AttentionConfigs:
     use_logn_attn: bool
     use_mla: bool
     v_head_dim: int
+    v_size_per_head: int    # used when kdim != vdim
+    sliding_window: int     # swa
 
     def __init__(self) -> None:
         ...
@@ -753,9 +756,11 @@ class HWKernelConfig:
 
 class HybridAttentionConfig:
     enable_hybrid_attention: bool
+    enable_independent_kv_cache_pools: bool
     hybrid_attention_types: list[HybridAttentionType]
+    swa_attention_config: SwaAttentionConfig
 
-    def __init__(self, enable_hybrid_attention: bool = False, hybrid_attention_types: list[HybridAttentionType] = []) -> None:
+    def __init__(self, enable_hybrid_attention: bool = False, hybrid_attention_types: list[HybridAttentionType] = [], enable_independent_kv_cache_pools: bool = False) -> None:
         ...
 
     def to_string(self) -> str:
@@ -1911,6 +1916,20 @@ class SpeculativeType:
 
     @property
     def value(self) -> int:
+        ...
+
+
+class SwaAttentionConfig:
+    add_sink_bias: bool
+    ga_kv_head_num: int
+    swa_kv_head_num: int
+    swa_rope_theta: float
+    window_size: int
+
+    def __init__(self, window_size: int = 0, swa_kv_head_num: int = 0, ga_kv_head_num: int = 0, swa_rope_theta: float = 0.0, add_sink_bias: bool = False) -> None:
+        ...
+
+    def to_string(self) -> str:
         ...
 
 

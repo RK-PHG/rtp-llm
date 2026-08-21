@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/HybridPoolConfigCreator.h"
 
 #include <algorithm>
+#include <numeric>
 
 #include "rtp_llm/cpp/cache/DSV4CacheConfigHelper.h"
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
@@ -59,6 +60,26 @@ KVCacheSpecPtr createFullAttentionSpec(const ModelConfig&       model_config,
     }
     spec->dtype     = dtype;
     spec->layer_num = layer_num;
+    return spec;
+}
+
+// attn_config.kv_head_num holds the *full-attention* head count. A hybrid model may
+// give its sliding-window layers a different one (MiMo V2.5: GA 4, SWA 8), which
+// changes the per-block stride, so the SWA group needs its own spec rather than the
+// full-attention one. Mirrors HybridConfigCreator::createSwaAttentionSpec().
+KVCacheSpecPtr createSwaAttentionSpec(const ModelConfig&       model_config,
+                                      const ParallelismConfig& parallelism_config,
+                                      rtp_llm::DataType        dtype,
+                                      uint32_t                 layer_num) {
+    auto spec                 = std::make_shared<MHAKVCacheSpec>(model_config.attn_config, parallelism_config);
+    spec->dtype               = dtype;
+    spec->layer_num           = layer_num;
+    const int swa_kv_head_num = model_config.hybrid_attention_config.swa_attention_config.swa_kv_head_num;
+    if (swa_kv_head_num > 0) {
+        const int tp            = parallelism_config.get_attn_tp_size();
+        spec->local_head_num_kv = static_cast<uint32_t>(
+            (swa_kv_head_num % tp == 0) ? swa_kv_head_num / tp : swa_kv_head_num / std::gcd(swa_kv_head_num, tp));
+    }
     return spec;
 }
 
@@ -241,7 +262,7 @@ void populateHybridAttentionGroups(CacheConfig&             config,
     appendGroup(config,
                 layers.swa_layers,
                 CacheGroupType::SWA,
-                createFullAttentionSpec(
+                createSwaAttentionSpec(
                     model_config, parallelism_config, dtype, static_cast<uint32_t>(layers.swa_layers.size())));
     appendGroup(config,
                 layers.linear_layers,

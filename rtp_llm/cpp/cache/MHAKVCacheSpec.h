@@ -13,33 +13,42 @@
 namespace rtp_llm {
 
 struct MHAKVCacheSpec: public KVCacheSpec {
+
     uint32_t size_per_head;
+    // 0 = identical to size_per_head (symmetric models, and hand-built specs in tests,
+    // leave this field unset)
+    uint32_t v_size_per_head = 0;
 
     MHAKVCacheSpec() = default;
 
     MHAKVCacheSpec(const AttentionConfigs& attn_config, const ParallelismConfig& parallelism_config) {
-        type              = KVCacheSpecType::MultiHeadAttention;
-        layer_num         = 1;  // Will be set by caller
+        type      = KVCacheSpecType::MultiHeadAttention;
+        layer_num = 1;  // Will be set by caller
 
-        // TODO(xinfei.sxf): 这里的head_num_kv分配逻辑需要和ModelConfig::getAttentionConfigs里保持一致，目前这里还是单独计算的
+        // TODO(xinfei.sxf):
+        // This head_num_kv sharding logic must stay consistent with
+        // ModelConfig::getAttentionConfigs; for now it is still computed separately here.
         local_head_num_kv = static_cast<uint32_t>(
             (attn_config.kv_head_num % parallelism_config.get_attn_tp_size() == 0) ?
                 attn_config.kv_head_num / parallelism_config.get_attn_tp_size() :
-                attn_config.kv_head_num / std::gcd(attn_config.kv_head_num, parallelism_config.get_attn_tp_size())
-        );
+                attn_config.kv_head_num / std::gcd(attn_config.kv_head_num, parallelism_config.get_attn_tp_size()));
         seq_size_per_block = static_cast<uint32_t>(attn_config.tokens_per_block);
         size_per_head      = static_cast<uint32_t>(attn_config.size_per_head);
+        v_size_per_head    = static_cast<uint32_t>(attn_config.vSizePerHead());
     }
 
     // TODO(xinfei.sxf) 下面的函数名字统一掉
     size_t block_size() const override {
-        return 2 * local_head_num_kv * size_per_head * seq_size_per_block;
+        // When K != V (e.g. MiMo V2.5 QK=192 / V=128) the two halves are sized separately.
+        // For symmetric models v_size_per_head == size_per_head, so the result is exactly
+        // the same as the original 2 * ... form.
+        return k_block_size() + v_block_size();
     }
     size_t k_block_size() const override {
         return local_head_num_kv * size_per_head * seq_size_per_block;
     }
     size_t v_block_size() const override {
-        return local_head_num_kv * size_per_head * seq_size_per_block;
+        return local_head_num_kv * (v_size_per_head > 0 ? v_size_per_head : size_per_head) * seq_size_per_block;
     }
 
     size_t block_size_bytes() const override {
@@ -134,6 +143,7 @@ struct MHAKVCacheSpec: public KVCacheSpec {
         std::ostringstream os;
         os << commonDebugString(indent);
         os << indent1 << "size_per_head=" << size_per_head << "\n";
+        os << indent1 << "v_size_per_head=" << v_size_per_head << "\n";
         os << indent1 << "scale_size_per_block=" << scale_size_per_block() << "\n";
         os << indent1 << "scale_size_bytes_per_block=" << scale_size_bytes_per_block() << "\n";
         os << indent1 << "scale_block_size_bytes=" << scale_block_size_bytes() << "\n";

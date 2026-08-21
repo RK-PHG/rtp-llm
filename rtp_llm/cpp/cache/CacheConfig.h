@@ -33,12 +33,17 @@ struct CacheConfig {
     std::vector<size_t>            group_kv_scale_stride_bytes;
     std::vector<size_t>            group_block_size_bytes;
     std::vector<uint32_t>          group_block_nums;
-    uint32_t                       dsv4_fixed_pool_blocks                  = 0;
-    uint32_t                       dsv4_hca_state_pool_blocks              = 0;
-    bool                           use_independent_block_pools              = false;
-    bool                           use_typed_cache_regions                  = false;
-    bool                           use_opaque_kv_cache_store                = false;
-    bool                           disable_decode_first_malloc_device_reuse = false;
+    // Per-group ring capacity in blocks. >0 marks a sliding-window group whose cache
+    // is a ring of that many blocks, so its per-request block count stops growing
+    // there instead of tracking the sequence length. 0 = allocate the whole sequence.
+    // See KVCacheGroup::setRingBlocks().
+    std::vector<uint32_t> group_ring_blocks;
+    uint32_t              dsv4_fixed_pool_blocks                   = 0;
+    uint32_t              dsv4_hca_state_pool_blocks               = 0;
+    bool                  use_independent_block_pools              = false;
+    bool                  use_typed_cache_regions                  = false;
+    bool                  use_opaque_kv_cache_store                = false;
+    bool                  disable_decode_first_malloc_device_reuse = false;
 
     // Model configuration
     rtp_llm::DataType dtype;
@@ -49,8 +54,14 @@ struct CacheConfig {
 
     // Block configuration
     uint32_t block_num;
-    size_t   seq_size_per_block        = 1;
-    size_t   kernel_seq_size_per_block = 1;
+    size_t   seq_size_per_block = 1;
+    // 0 = unset, meaning "same as seq_size_per_block" (no kernel-block split).
+    // Must stay 0 rather than any legitimate-looking size: the normalization in
+    // CacheConfigCreator::createConfig() only fires on the 0 sentinel, so a
+    // non-zero default silently survives and makes kernelBlocksPerKvBlock()
+    // split every physical block, while consumers that read
+    // AttentionConfigs::kernel_tokens_per_block still see the physical size.
+    size_t kernel_seq_size_per_block = 0;
 
     // Returns how many kernel blocks fit inside one physical (kv-manager) block.
     size_t kernelBlocksPerKvBlock() const {
@@ -115,11 +126,11 @@ struct CacheConfig {
         for (size_t gid = 0; gid < group_block_nums.size(); ++gid) {
             const bool is_swa = gid < group_types.size() && group_types[gid] == CacheGroupType::SWA;
             const auto region = gid < group_region_names.size() ? group_region_names[gid] : KVCacheRegionName::DEFAULT;
-            const bool is_dsv4_fixed_region       = isDsv4FixedRegion(region);
-            const bool use_explicit_hca_blocks    = region == KVCacheRegionName::HCA_STATE
-                                                 && dsv4_hca_state_pool_blocks > 0;
-            const bool use_explicit_fixed_blocks  = is_dsv4_fixed_region && dsv4_fixed_pool_blocks > 0;
-            const bool use_explicit_dsv4_blocks   = use_explicit_hca_blocks || use_explicit_fixed_blocks;
+            const bool is_dsv4_fixed_region = isDsv4FixedRegion(region);
+            const bool use_explicit_hca_blocks =
+                region == KVCacheRegionName::HCA_STATE && dsv4_hca_state_pool_blocks > 0;
+            const bool use_explicit_fixed_blocks = is_dsv4_fixed_region && dsv4_fixed_pool_blocks > 0;
+            const bool use_explicit_dsv4_blocks  = use_explicit_hca_blocks || use_explicit_fixed_blocks;
             uint32_t   rule_blocks;
             if (use_explicit_hca_blocks) {
                 rule_blocks = dsv4_hca_state_pool_blocks;
@@ -197,6 +208,7 @@ struct CacheConfig {
         OUTPUT_FIELD(use_opaque_kv_cache_store);
         OUTPUT_FIELD(disable_decode_first_malloc_device_reuse);
         os << indent1 << "group_block_nums=" << rtp_llm::vectorToString(group_block_nums) << "\n";
+        os << indent1 << "group_ring_blocks=" << rtp_llm::vectorToString(group_ring_blocks) << "\n";
         os << "\n";
 
         // Cache specification section

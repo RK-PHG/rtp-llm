@@ -4,7 +4,11 @@
 namespace rtp_llm {
 
 int FullKVCacheGroup::needBlocksNum(int seq_len, int current_blocks, int reserve_step) const {
-    return std::max((seq_len + reserve_step + seq_size_per_block_ - 1) / seq_size_per_block_ - current_blocks, 0);
+    // capToRing() is a no-op unless this group's cache is a sliding-window ring, in
+    // which case the block list stops growing at the ring size — see
+    // KVCacheGroup::setRingBlocks().
+    const int want = capToRing((seq_len + reserve_step + seq_size_per_block_ - 1) / seq_size_per_block_);
+    return std::max(want - current_blocks, 0);
 }
 
 NeedBlocksInfo FullKVCacheGroup::getNeedBlocks(

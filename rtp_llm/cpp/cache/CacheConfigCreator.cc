@@ -40,7 +40,7 @@ size_t fallbackFixedPoolHbmBytes(const CacheConfig& config) {
             if (!isDsv4FixedRegion(region)) {
                 continue;
             }
-            const bool explicit_hca = region == KVCacheRegionName::HCA_STATE && config.dsv4_hca_state_pool_blocks > 0;
+            const bool explicit_hca   = region == KVCacheRegionName::HCA_STATE && config.dsv4_hca_state_pool_blocks > 0;
             const bool explicit_fixed = config.dsv4_fixed_pool_blocks > 0;
             if (!explicit_hca && !explicit_fixed) {
                 bytes += config.group_block_size_bytes[gid];
@@ -116,12 +116,19 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
                                     kv_cache_config.kernel_seq_size_per_block);
         }
         config.kernel_seq_size_per_block = kernel_seq_size_per_block;
-    } else if (config.kernel_seq_size_per_block == 0 || config.kernel_seq_size_per_block == config.seq_size_per_block) {
-        // Default: kernel block size == physical block size (no split). Keep
-        // any explicit value already set by createBasicConfig (e.g. DSV4 forces
-        // kernel_seq_size_per_block = 256 even when physical seq_size > 256).
+    } else if (config.kernel_seq_size_per_block == 0
+               || config.seq_size_per_block % config.kernel_seq_size_per_block != 0) {
+        // No split requested. Keep an explicit value already set by
+        // createBasicConfig (e.g. DSV4 forces kernel_seq_size_per_block = 256 even
+        // when physical seq_size > 256); otherwise kernel block size == physical
+        // block size (no split).
         config.kernel_seq_size_per_block = config.seq_size_per_block;
     }
+    RTP_LLM_CHECK_WITH_INFO(config.kernel_seq_size_per_block > 0
+                                && config.seq_size_per_block % config.kernel_seq_size_per_block == 0,
+                            "kernel_seq_size_per_block(%zu) must be a non-zero divisor of seq_size_per_block(%zu)",
+                            config.kernel_seq_size_per_block,
+                            config.seq_size_per_block);
 
     // DSV4 fixed-pool residency toggle must be set before the pre-pass
     // finalizeBlockNums so CPU-backed STATE/SWA_KV bytes are excluded from HBM.
@@ -154,8 +161,8 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
                              config.fixed_pool_reserve_bytes / 1024 / 1024,
                              paged_budget / 1024 / 1024);
         }
-        const int  joint_step       = std::max(1, config.linear_step);
-        block_num = paged_budget / effectivePagedBlockBytes(config, joint_step);
+        const int joint_step = std::max(1, config.linear_step);
+        block_num            = paged_budget / effectivePagedBlockBytes(config, joint_step);
     }
     RTP_LLM_CHECK_WITH_INFO(block_num > 0,
                             "kv cache needs at least 1 block but %ld, each block needs %ld MiB memory",
@@ -212,17 +219,16 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
         score_config.kernel_seq_size_per_block   = kernel_seq_size_per_block;
         propose_config.kernel_seq_size_per_block = kernel_seq_size_per_block;
     } else {
-        // Default: kernel block size == physical block size (no split). Keep
-        // any explicit value already set by createBasicConfig (e.g. DSV4
-        // forces kernel_seq_size_per_block = 256 even when physical
-        // seq_size_per_block > 256); only fill in when unset or already
-        // matches the physical block.
+        // No split requested. Keep an explicit value already set by
+        // createBasicConfig (e.g. DSV4 forces kernel_seq_size_per_block = 256
+        // even when physical seq_size_per_block > 256); otherwise kernel block
+        // size == physical block size (no split).
         if (score_config.kernel_seq_size_per_block == 0
-            || score_config.kernel_seq_size_per_block == score_config.seq_size_per_block) {
+            || score_config.seq_size_per_block % score_config.kernel_seq_size_per_block != 0) {
             score_config.kernel_seq_size_per_block = score_config.seq_size_per_block;
         }
         if (propose_config.kernel_seq_size_per_block == 0
-            || propose_config.kernel_seq_size_per_block == propose_config.seq_size_per_block) {
+            || propose_config.seq_size_per_block % propose_config.kernel_seq_size_per_block != 0) {
             propose_config.kernel_seq_size_per_block = propose_config.seq_size_per_block;
         }
     }

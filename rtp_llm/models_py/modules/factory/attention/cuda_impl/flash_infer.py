@@ -44,6 +44,11 @@ class FlashInferPrefillImpl(FMHAImplBase):
         attn_configs: AttentionConfigs,
         attn_inputs: PyAttentionInputs,
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         # Check MLA is not enabled
         if attn_configs.use_mla:
             return False
@@ -102,6 +107,11 @@ class FlashInferDecodeImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         # Check MLA is not enabled
         if attn_configs.use_mla:
             return False

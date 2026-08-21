@@ -174,8 +174,8 @@ void BlockPool::initializeCacheBuffer() {
     }
     cache_base_ptr_ = cache_aligned_buffer_.data_ptr();
     RTP_LLM_CHECK_WITH_INFO(cache_base_ptr_ != nullptr, "block pool allocate cache aligned buffer is null");
-    const bool is_cuda   = cache_aligned_buffer_.is_cuda();
-    const bool is_pinned = !is_cuda && cache_aligned_buffer_.is_pinned();
+    const bool              is_cuda     = cache_aligned_buffer_.is_cuda();
+    const bool              is_pinned   = !is_cuda && cache_aligned_buffer_.is_pinned();
     static constexpr double kBytesPerMB = 1024.0 * 1024.0;
     RTP_LLM_LOG_INFO("BlockPool backing selected: pool_name=%s allocation_type=%s requested_backing=%s "
                      "actual_backing=%s is_cuda=%d is_pinned=%d ptr=%p total_size=%zu bytes total_size_mb=%.2f "
@@ -274,6 +274,45 @@ void BlockPool::initializeLayoutStrategies() {
         processMemoryLayout(layout_idx, full_tensor, global_layer_begin);
         global_layer_begin += static_cast<size_t>(config_.memory_layouts[layout_idx].layer_num);
     }
+
+    // Dual layout with interleaved GA/SWA layers (MiMo V2.5): layer ids are not a
+    // contiguous range, so an explicit mapping overrides the default cursor-built one
+    // above. No effect when the mapping is empty (MTP / regular paths).
+    applyExplicitLayerMapping();
+}
+
+void BlockPool::applyExplicitLayerMapping() {
+    const auto& mapping = config_.explicit_layer_mapping;
+    if (mapping.empty()) {
+        return;
+    }
+    RTP_LLM_CHECK_WITH_INFO(mapping.size() == global_layer_to_local_.size(),
+                            "explicit_layer_mapping size mismatch: mapping=%zu total_layers=%zu",
+                            mapping.size(),
+                            global_layer_to_local_.size());
+    for (size_t global_layer = 0; global_layer < mapping.size(); ++global_layer) {
+        const auto [layout_idx, local_layer] = mapping[global_layer];
+        RTP_LLM_CHECK_WITH_INFO(layout_idx >= 0 && static_cast<size_t>(layout_idx) < layout_strategies_.size(),
+                                "explicit mapping layout_idx %d out of range (layouts=%zu) for layer %zu",
+                                layout_idx,
+                                layout_strategies_.size(),
+                                global_layer);
+        const auto& layer_tensors = layout_strategies_[static_cast<size_t>(layout_idx)]->getLayerCacheTensors();
+        RTP_LLM_CHECK_WITH_INFO(local_layer >= 0 && static_cast<size_t>(local_layer) < layer_tensors.size(),
+                                "explicit mapping local_layer %d out of range (layers=%zu) for layer %zu",
+                                local_layer,
+                                layer_tensors.size(),
+                                global_layer);
+        global_layer_to_local_[global_layer]   = {layout_idx, local_layer};
+        global_layer_kv_tensors_[global_layer] = layer_tensors[static_cast<size_t>(local_layer)];
+
+        const auto& scale_tensors = layout_strategies_[static_cast<size_t>(layout_idx)]->getLayerScaleCacheTensors();
+        global_layer_kv_scale_tensors_[global_layer] =
+            scale_tensors.empty() ? torch::Tensor() : scale_tensors[static_cast<size_t>(local_layer)];
+    }
+    RTP_LLM_LOG_INFO("BlockPool applied explicit layer mapping for %zu layers across %zu layouts",
+                     mapping.size(),
+                     layout_strategies_.size());
 }
 
 void BlockPool::processMemoryLayout(size_t layout_idx, const torch::Tensor& full_tensor, size_t& global_layer_begin) {

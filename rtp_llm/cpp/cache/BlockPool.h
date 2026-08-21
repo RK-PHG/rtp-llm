@@ -68,6 +68,15 @@ public:
     std::vector<BlockInfo>
     convertIndexToBuffer(int layer_id, int block_id, int partition_count, int partition_id) const;
 
+    // Whether the dual-layout explicit layer mapping is enabled (MiMo V2.5 interleaved
+    // GA/SWA case). When enabled, callers (KVCacheGroup / HybridTypeKVCacheAllocator)
+    // should pass global layer ids directly and the mapping table translates them to
+    // {layout, local layer}. When disabled, the legacy in-group index (physical slot)
+    // semantics still apply.
+    bool hasExplicitLayerMapping() const {
+        return !config_.explicit_layer_mapping.empty();
+    }
+
     void* getBaseAddress() const {
         return cache_base_ptr_;
     }
@@ -89,6 +98,9 @@ private:
     void initializeCudaMallocBuffer();
     void initializeLayerMappings();
     void initializeLayoutStrategies();
+    // Dual-layout explicit layer mapping (overrides the cursor-built mapping when
+    // config_.explicit_layer_mapping is non-empty)
+    void applyExplicitLayerMapping();
 
     // Helper functions for initializeLayoutStrategies()
     void          processMemoryLayout(size_t layout_idx, const torch::Tensor& full_tensor, size_t& global_layer_begin);

@@ -265,7 +265,9 @@ class CudaFp8DeepGEMMLinear(LinearBase):
     ) -> torch.Tensor:
         """Run DeepGEMM with a caller-provided FP8 input and matching scales."""
         if input_fp8.dtype != torch.float8_e4m3fn:
-            error_msg = f"Quantized input dtype must be float8_e4m3fn, got {input_fp8.dtype}"
+            error_msg = (
+                f"Quantized input dtype must be float8_e4m3fn, got {input_fp8.dtype}"
+            )
             logger.error(error_msg)
             raise ValueError(error_msg)
         M, _ = self._validate_input(input_fp8)

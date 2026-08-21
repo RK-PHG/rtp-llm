@@ -202,7 +202,38 @@ class AttnImplFactory(object):
         attn_configs = model_config.getAttentionConfigs(
             parallelism_config.get_attn_tp_size()
         )
-        attn_inputs.headwise_config = getattr(model_config, "headwise_config", None)
+        return cls.get_fmha_impl_with_configs(
+            attn_configs,
+            parallelism_config,
+            weight,
+            attn_inputs,
+            fmha_config=fmha_config,
+            quant_config=model_config.quant_config,
+            max_seq_len=model_config.max_seq_len,
+            headwise_config=getattr(model_config, "headwise_config", None),
+            is_cuda_graph=is_cuda_graph,
+        )
+
+    @classmethod
+    def get_fmha_impl_with_configs(
+        cls,
+        attn_configs: AttentionConfigs,
+        parallelism_config,
+        weight: ModelWeights,
+        attn_inputs: PyAttentionInputs,
+        fmha_config: Optional[FMHAConfig] = None,
+        quant_config: Optional[object] = None,
+        max_seq_len: int = 0,
+        headwise_config: Optional[object] = None,
+        is_cuda_graph: bool = False,
+    ) -> FMHAImplBase:
+        """Select an fmha implementation directly from AttentionConfigs.
+
+        Intended for models with per-layer heterogeneity (e.g. the MiMo V2.5 GA/SWA
+        dual fmha instances): the caller can pass separately overridden attn_configs
+        for each layer kind without having to build multiple model_config objects.
+        """
+        attn_inputs.headwise_config = headwise_config
         key_str = "mla" if attn_configs.use_mla else "mha"
         fmha_impl_method = cls.FMHA_IMPL_REGISTRY[key_str]
         instance = fmha_impl_method(
@@ -210,9 +241,9 @@ class AttnImplFactory(object):
             weight,
             attn_inputs,
             fmha_config,
-            model_config.quant_config,
+            quant_config,
             is_cuda_graph,
-            model_config.max_seq_len,
+            max_seq_len,
             parallelism_config,
         )
         logging.debug(f"get fmha impl: {type(instance).__name__}")

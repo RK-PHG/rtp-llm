@@ -1,9 +1,11 @@
 #include "rtp_llm/cpp/cache/HybridConfigCreator.h"
 
+#include <algorithm>
 #include <numeric>
 
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
 #include "rtp_llm/cpp/cache/MemoryEvaluationHelper.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 
 namespace rtp_llm {
 
@@ -22,43 +24,52 @@ std::vector<std::vector<int>> HybridConfigCreator::splitIntoGroups(const std::ve
     return groups;
 }
 
-int HybridConfigCreator::calculateGroupLayerNum(int linear_layer_count, int full_layer_count) {
-    int group_layer_num = 0;
-    if (linear_layer_count > 0 && full_layer_count > 0) {
-        group_layer_num = std::gcd(linear_layer_count, full_layer_count);
-    } else {
-        group_layer_num = std::max(linear_layer_count, full_layer_count);
+int HybridConfigCreator::calculateGroupLayerNum(int linear_layer_count, int full_layer_count, int swa_layer_count) {
+    // Take the gcd of the non-zero per-kind layer counts; with a single kind this is just
+    // that kind's layer count (compatible with the old two-argument behavior)
+    std::vector<int> nonzero;
+    for (int c : {linear_layer_count, full_layer_count, swa_layer_count}) {
+        if (c > 0) {
+            nonzero.push_back(c);
+        }
     }
-    group_layer_num = std::max(group_layer_num, 1);
-    return group_layer_num;
+    if (nonzero.empty()) {
+        return 1;
+    }
+    int g = nonzero[0];
+    for (size_t i = 1; i < nonzero.size(); ++i) {
+        g = std::gcd(g, nonzero[i]);
+    }
+    return std::max(g, 1);
 }
 
-std::pair<std::vector<int>, std::vector<int>>
-HybridConfigCreator::splitLayersByAttentionType(const ModelConfig& model_config) {
+HybridConfigCreator::LayerSplit HybridConfigCreator::splitLayersByAttentionType(const ModelConfig& model_config) {
     int64_t layer_num = model_config.num_layers;
     RTP_LLM_CHECK_WITH_INFO(layer_num > 0, "invalid model_config.num_layers=%ld", layer_num);
 
-    std::vector<int> linear_layers;
-    std::vector<int> full_layers;
-    linear_layers.reserve(layer_num);
-    full_layers.reserve(layer_num);
+    LayerSplit out;
+    out.linear_layers.reserve(layer_num);
+    out.full_layers.reserve(layer_num);
+    out.swa_layers.reserve(layer_num);
 
     const auto& types = model_config.hybrid_attention_config.hybrid_attention_types;
     for (int i = 0; i < static_cast<int>(layer_num); ++i) {
-        if (types[static_cast<size_t>(i)] == HybridAttentionType::LINEAR) {
-            linear_layers.push_back(i);
-        } else {
-            full_layers.push_back(i);
+        switch (types[static_cast<size_t>(i)]) {
+            case HybridAttentionType::LINEAR:
+                out.linear_layers.push_back(i);
+                break;
+            case HybridAttentionType::SLIDING_WINDOW:
+                out.swa_layers.push_back(i);
+                break;
+            default:
+                out.full_layers.push_back(i);
+                break;
         }
     }
-
-    return std::make_pair(std::move(linear_layers), std::move(full_layers));
+    return out;
 }
 
-CacheConfig HybridConfigCreator::initializeConfig(const ModelConfig&      model_config,
-                                                  const std::vector<int>& linear_layers,
-                                                  const std::vector<int>& full_layers,
-                                                  rtp_llm::DataType       dtype) {
+CacheConfig HybridConfigCreator::initializeConfig(const ModelConfig& model_config, rtp_llm::DataType dtype) {
     int64_t layer_num = model_config.num_layers;
 
     CacheConfig config;
@@ -69,11 +80,6 @@ CacheConfig HybridConfigCreator::initializeConfig(const ModelConfig&      model_
     config.use_mla            = model_config.attn_config.use_mla;
     config.dtype              = dtype;
     config.linear_step        = 1;
-
-    config.global_layer_ids.push_back(linear_layers);
-    config.global_layer_ids.push_back(full_layers);
-    config.layer_ids.push_back(linear_layers);
-    config.layer_ids.push_back(full_layers);
 
     return config;
 }
@@ -100,61 +106,159 @@ KVCacheSpecPtr HybridConfigCreator::createLinearAttentionSpec(const ModelConfig&
     return linear_spec;
 }
 
-std::pair<std::vector<std::vector<int>>, std::vector<std::vector<int>>> HybridConfigCreator::createLayerGroups(
-    const std::vector<int>& linear_layers, const std::vector<int>& full_layers, int& group_layer_num) {
-    const int linear_cnt = static_cast<int>(linear_layers.size());
-    const int full_cnt   = static_cast<int>(full_layers.size());
-    group_layer_num      = HybridConfigCreator::calculateGroupLayerNum(linear_cnt, full_cnt);
-
-    const auto linear_groups = HybridConfigCreator::splitIntoGroups(linear_layers, group_layer_num);
-    const auto full_groups   = HybridConfigCreator::splitIntoGroups(full_layers, group_layer_num);
-
-    return std::make_pair(std::move(linear_groups), std::move(full_groups));
+KVCacheSpecPtr HybridConfigCreator::createSwaAttentionSpec(const ModelConfig&       model_config,
+                                                           const ParallelismConfig& parallelism_config,
+                                                           rtp_llm::DataType        dtype) {
+    auto swa_spec   = std::make_shared<MHAKVCacheSpec>(model_config.attn_config, parallelism_config);
+    swa_spec->dtype = dtype;
+    // attn_config.kv_head_num holds the GA value; the SWA layer head count is taken
+    // explicitly from swa_attention_config
+    const int swa_kv_head_num = model_config.hybrid_attention_config.swa_attention_config.swa_kv_head_num;
+    if (swa_kv_head_num > 0) {
+        const int tp                = parallelism_config.get_attn_tp_size();
+        swa_spec->local_head_num_kv = static_cast<uint32_t>(
+            (swa_kv_head_num % tp == 0) ? swa_kv_head_num / tp : swa_kv_head_num / std::gcd(swa_kv_head_num, tp));
+    }
+    return swa_spec;
 }
 
-void HybridConfigCreator::setupCacheConfigSpecs(CacheConfig&                         config,
-                                                const std::vector<std::vector<int>>& linear_groups,
-                                                const std::vector<std::vector<int>>& full_groups,
-                                                const KVCacheSpecPtr&                linear_spec,
-                                                const KVCacheSpecPtr&                full_spec) {
+bool HybridConfigCreator::usePerLayerRowLayout(const LayerSplit&     split,
+                                               const KVCacheSpecPtr& full_spec,
+                                               const KVCacheSpecPtr& swa_spec) {
+    // Mirrors BlockPoolConfigHelper::useDualStrideLayouts(): no LINEAR group, and at
+    // least two groups whose per-block strides differ. With per-type grouping the
+    // "more than one group" part means both a full and a SWA class exist.
+    if (!split.linear_layers.empty() || split.full_layers.empty() || split.swa_layers.empty()) {
+        return false;
+    }
+    if (full_spec == nullptr || swa_spec == nullptr) {
+        return false;
+    }
+    return full_spec->block_size_bytes() != swa_spec->block_size_bytes();
+}
+
+HybridConfigCreator::LayerGroups
+HybridConfigCreator::createLayerGroups(const LayerSplit& split, bool per_layer_row_layout, int& group_layer_num) {
+    const int linear_cnt = static_cast<int>(split.linear_layers.size());
+    const int full_cnt   = static_cast<int>(split.full_layers.size());
+    const int swa_cnt    = static_cast<int>(split.swa_layers.size());
+
+    LayerGroups groups;
+
+    if (per_layer_row_layout) {
+        // One group per attention type, i.e. do not subdivide a type any further.
+        //
+        // A cache group is the unit of block-id allocation: every group mallocs its
+        // own ids, and one id reserves a cell in *every* row of the pool. The legacy
+        // layout gives the pool exactly `group_layer_num` rows shared by all groups,
+        // so an id is fully consumed by whoever takes it and the group count is free
+        // — smaller groups mean a cheaper id and proportionally more ids. That is why
+        // gcd subdivision costs nothing there, and it is only there to satisfy the
+        // structural requirement that all groups have equal layer counts.
+        //
+        // The per-layer-row layout breaks that trade: the pool has one row per model
+        // layer (9 + 39 for MiMo V2.5), so an id always reserves all 48 rows while a
+        // 3-layer group uses 3 of them — a 48/3 = 16x loss. Nothing here needs equal
+        // group sizes either: KVCacheGroup::init() addresses layer tensors by global
+        // layer id under an explicit layer mapping, not by index within the group.
+        groups.full_groups = HybridConfigCreator::splitIntoGroups(split.full_layers, full_cnt);
+        groups.swa_groups  = HybridConfigCreator::splitIntoGroups(split.swa_layers, swa_cnt);
+        // Groups are deliberately unequal, so group_layer_num has no single value.
+        // Only the legacy branch of BlockPoolConfigHelper::createConfig() reads it and
+        // that branch is unreachable here; publish the max so any other consumer that
+        // treats it as "rows needed" cannot under-count.
+        group_layer_num = std::max(full_cnt, swa_cnt);
+        return groups;
+    }
+
+    group_layer_num      = HybridConfigCreator::calculateGroupLayerNum(linear_cnt, full_cnt, swa_cnt);
+    groups.linear_groups = HybridConfigCreator::splitIntoGroups(split.linear_layers, group_layer_num);
+    groups.full_groups   = HybridConfigCreator::splitIntoGroups(split.full_layers, group_layer_num);
+    groups.swa_groups    = HybridConfigCreator::splitIntoGroups(split.swa_layers, group_layer_num);
+    return groups;
+}
+
+void HybridConfigCreator::setupCacheConfigSpecs(CacheConfig&          config,
+                                                const LayerGroups&    groups,
+                                                const KVCacheSpecPtr& linear_spec,
+                                                const KVCacheSpecPtr& full_spec,
+                                                const KVCacheSpecPtr& swa_spec,
+                                                int                   swa_ring_blocks) {
     config.global_layer_ids.clear();
     config.layer_ids.clear();
     config.cache_specs.clear();
     config.group_types.clear();
+    config.group_ring_blocks.clear();
 
-    // Keep order: all full groups first, then linear groups.
-    for (const auto& g : full_groups) {
+    // Keep order: all full groups first, then swa groups, then linear groups.
+    for (const auto& g : groups.full_groups) {
         config.global_layer_ids.push_back(g);
         config.layer_ids.push_back(g);
         config.cache_specs.push_back(full_spec);
         config.group_types.push_back(CacheGroupType::FULL);
+        config.group_ring_blocks.push_back(0);
     }
-    for (const auto& g : linear_groups) {
+    for (const auto& g : groups.swa_groups) {
+        config.global_layer_ids.push_back(g);
+        config.layer_ids.push_back(g);
+        config.cache_specs.push_back(swa_spec);
+        // Still typed FULL: the group keeps ordinary paged semantics and ordinary
+        // block-cache behaviour. What bounds its footprint is group_ring_blocks, not
+        // the group type — CacheGroupType::SWA selects SWAKVCacheGroup, whose
+        // "full-length list with only the tail materialized" policy is a different
+        // scheme aimed at DSV4's fixed ring pools and does not fit a 64-token page.
+        config.group_types.push_back(CacheGroupType::FULL);
+        config.group_ring_blocks.push_back(static_cast<uint32_t>(swa_ring_blocks));
+    }
+    for (const auto& g : groups.linear_groups) {
         config.global_layer_ids.push_back(g);
         config.layer_ids.push_back(g);
         config.cache_specs.push_back(linear_spec);
         config.group_types.push_back(CacheGroupType::LINEAR);
+        config.group_ring_blocks.push_back(0);
     }
-    config.linear_group_num = static_cast<int>(linear_groups.size());
-    config.full_group_num   = static_cast<int>(full_groups.size());
+    config.linear_group_num = static_cast<int>(groups.linear_groups.size());
+    config.swa_group_num    = static_cast<int>(groups.swa_groups.size());
+    config.full_group_num   = static_cast<int>(groups.full_groups.size());
 }
 
-void HybridConfigCreator::setupPhysicalSizes(CacheConfig&          config,
-                                             const KVCacheSpecPtr& full_spec,
-                                             const KVCacheSpecPtr& linear_spec) {
-    // Decide the physical KV block/scale sizes by taking max between full and linear specs.
-    const size_t full_kv_block_stride_bytes   = full_spec->block_size_bytes();
-    const size_t linear_kv_block_stride_bytes = linear_spec->block_size_bytes();
+void HybridConfigCreator::setupPhysicalSizes(CacheConfig& config) {
+    // Under a dual layout (e.g. MiMo, where GA/SWA strides differ) each group uses the
+    // real stride of its own spec, recorded in group_kv_block_stride_bytes
+    // (BlockPoolConfigHelper reads it in preference to the compat field below).
+    config.group_kv_block_stride_bytes.clear();
+    config.group_kv_scale_stride_bytes.clear();
+    config.group_block_size_bytes.clear();
+    for (const auto& spec : config.cache_specs) {
+        config.group_kv_block_stride_bytes.push_back(spec->block_size_bytes());
+        config.group_kv_scale_stride_bytes.push_back(spec->scale_block_size_bytes());
+        config.group_block_size_bytes.push_back(spec->block_size_bytes() + spec->scale_block_size_bytes());
+    }
 
-    // now we only support that linear attention block have padding
-    RTP_LLM_CHECK_WITH_INFO(full_kv_block_stride_bytes >= linear_kv_block_stride_bytes,
-                            "not support full attention with padding now");
+    // Compat fields: still fill in one representative value (some legacy code reads them),
+    // using the maximum stride. Note the original full >= linear assertion was removed --
+    // MiMo's GA stride is smaller than its SWA stride, and under a dual layout each group
+    // uses its own real stride instead of padding to a single unified stride.
+    size_t max_kv = 0, max_scale = 0;
+    for (const auto& s : config.cache_specs) {
+        max_kv    = std::max(max_kv, s->block_size_bytes());
+        max_scale = std::max(max_scale, s->scale_block_size_bytes());
+    }
+    config.kv_block_stride_bytes = max_kv;
+    config.kv_scale_stride_bytes = max_scale;
 
-    config.kv_block_stride_bytes = full_kv_block_stride_bytes;
-    config.kv_block_size_bytes   = static_cast<size_t>(config.group_layer_num) * config.kv_block_stride_bytes;
-    config.kv_scale_stride_bytes = full_spec->scale_block_size_bytes();
-    config.kv_scale_size_bytes   = static_cast<size_t>(config.group_layer_num) * config.kv_scale_stride_bytes;
-    config.block_size_bytes      = config.kv_block_size_bytes + config.kv_scale_size_bytes;
+    // block_size_bytes = sum over groups of (group layer_num * that group's real stride).
+    // With two distinct strides this reflects the true total cost across all layers; with a
+    // single stride it is equivalent to total_layers * stride.
+    size_t total_kv = 0, total_scale = 0;
+    for (size_t i = 0; i < config.cache_specs.size(); ++i) {
+        size_t layers_in_group = config.layer_ids[i].size();
+        total_kv += layers_in_group * config.group_kv_block_stride_bytes[i];
+        total_scale += layers_in_group * config.group_kv_scale_stride_bytes[i];
+    }
+    config.kv_block_size_bytes = total_kv;
+    config.kv_scale_size_bytes = total_scale;
+    config.block_size_bytes    = total_kv + total_scale;
 }
 
 void HybridConfigCreator::setupLayerToGroupMapping(CacheConfig& config) {
@@ -173,27 +277,73 @@ CacheConfig HybridConfigCreator::createHybridConfig(const ModelConfig&       mod
                                                     bool                     is_mtp) {
     auto dtype = MemoryEvaluationHelper::getDataTypeForCache(model_config);
 
-    // Split layers by attention type
-    auto [linear_layers, full_layers] = HybridConfigCreator::splitLayersByAttentionType(model_config);
+    // Split layers by attention type (linear / full / swa)
+    const LayerSplit split = HybridConfigCreator::splitLayersByAttentionType(model_config);
 
     // Initialize config
-    CacheConfig config = HybridConfigCreator::initializeConfig(model_config, linear_layers, full_layers, dtype);
+    CacheConfig config = HybridConfigCreator::initializeConfig(model_config, dtype);
 
     // Create attention specs
-    auto full_spec   = HybridConfigCreator::createFullAttentionSpec(model_config, parallelism_config, dtype);
-    auto linear_spec = HybridConfigCreator::createLinearAttentionSpec(model_config, parallelism_config, dtype);
+    auto full_spec = HybridConfigCreator::createFullAttentionSpec(model_config, parallelism_config, dtype);
 
-    // Create layer groups and calculate group layer number
-    int group_layer_num = 0;
-    auto [linear_groups, full_groups] =
-        HybridConfigCreator::createLayerGroups(linear_layers, full_layers, group_layer_num);
+    KVCacheSpecPtr linear_spec;
+    if (!split.linear_layers.empty()) {
+        linear_spec = HybridConfigCreator::createLinearAttentionSpec(model_config, parallelism_config, dtype);
+    }
+
+    KVCacheSpecPtr swa_spec;
+    if (!split.swa_layers.empty()) {
+        // Mixed GA/SWA (e.g. MiMo V2.5):
+        // - attn_config.kv_head_num holds the GA value, so full_spec is already correct;
+        // - the SWA head count is taken explicitly by createSwaAttentionSpec() from
+        //   swa_attention_config.swa_kv_head_num.
+        swa_spec = HybridConfigCreator::createSwaAttentionSpec(model_config, parallelism_config, dtype);
+    }
+
+    // Create layer groups and calculate group layer number. Grouping granularity
+    // depends on which pool layout BlockPoolConfigHelper will pick, so decide that
+    // first — see usePerLayerRowLayout().
+    const bool  per_layer_row_layout = HybridConfigCreator::usePerLayerRowLayout(split, full_spec, swa_spec);
+    int         group_layer_num      = 0;
+    LayerGroups groups     = HybridConfigCreator::createLayerGroups(split, per_layer_row_layout, group_layer_num);
     config.group_layer_num = group_layer_num;
+    RTP_LLM_LOG_INFO("hybrid cache grouping: per_layer_row_layout=%d group_layer_num=%d "
+                     "(linear=%zu full=%zu swa=%zu groups)",
+                     static_cast<int>(per_layer_row_layout),
+                     group_layer_num,
+                     groups.linear_groups.size(),
+                     groups.full_groups.size(),
+                     groups.swa_groups.size());
+
+    // A sliding-window group's cache is a ring of exactly window/page blocks: the
+    // layer only ever reads the last `window` tokens, so position p can live at ring
+    // slot p % window and the per-request footprint stops growing. This requires the
+    // page size to divide the window — otherwise the wrap point falls inside a page
+    // and the ring would hold stale slots at arbitrary positions that `window_left`
+    // cannot mask out (it masks by position, not by slot). When it does not divide,
+    // fall back to 0 = allocate the whole sequence. Keep in sync with
+    // swa_ring_pages() in py_flashinfer_mha.py.
+    int swa_ring_blocks = 0;
+    if (!split.swa_layers.empty()) {
+        const int window = model_config.hybrid_attention_config.swa_attention_config.window_size > 0 ?
+                               model_config.hybrid_attention_config.swa_attention_config.window_size :
+                               static_cast<int>(model_config.attn_config.sliding_window);
+        const int page   = static_cast<int>(config.seq_size_per_block);
+        if (window > 0 && page > 0 && window % page == 0) {
+            swa_ring_blocks = window / page;
+        } else if (window > 0) {
+            RTP_LLM_LOG_WARNING("SWA ring disabled: sliding_window=%d is not a multiple of "
+                                "seq_size_per_block=%d, falling back to full-length allocation",
+                                window,
+                                page);
+        }
+    }
 
     // Setup cache config specs
-    HybridConfigCreator::setupCacheConfigSpecs(config, linear_groups, full_groups, linear_spec, full_spec);
+    HybridConfigCreator::setupCacheConfigSpecs(config, groups, linear_spec, full_spec, swa_spec, swa_ring_blocks);
 
-    // Setup physical sizes
-    HybridConfigCreator::setupPhysicalSizes(config, full_spec, linear_spec);
+    // Setup physical sizes (per-group strides + compat fields)
+    HybridConfigCreator::setupPhysicalSizes(config);
 
     // Setup layer to group mapping
     HybridConfigCreator::setupLayerToGroupMapping(config);
@@ -219,10 +369,18 @@ CacheConfig HybridConfigCreator::createHybridConfig(const ModelConfig&       mod
     }
 
     // Per-layer block stride (kv + scale).
-    // For hybrid attention, the physical per-layer stride follows the selected physical layout stride.
-    const size_t per_layer_stride_bytes = config.kv_block_stride_bytes + config.kv_scale_stride_bytes;
-    config.layer_to_block_stride_bytes.assign(static_cast<size_t>(config.layer_all_num),
-                                              static_cast<int>(per_layer_stride_bytes));
+    // Under a dual layout, fill in the real stride of the group each layer belongs to;
+    // under a single layout (all groups share a stride) this matches the original logic.
+    config.layer_to_block_stride_bytes.assign(static_cast<size_t>(config.layer_all_num), 0);
+    for (size_t l = 0; l < config.layer_to_group_id.size() && l < config.layer_to_block_stride_bytes.size(); ++l) {
+        const int gid = config.layer_to_group_id[l];
+        if (gid >= 0 && static_cast<size_t>(gid) < config.group_block_size_bytes.size()) {
+            config.layer_to_block_stride_bytes[l] = static_cast<int>(config.group_block_size_bytes[gid]);
+        } else {
+            config.layer_to_block_stride_bytes[l] =
+                static_cast<int>(config.kv_block_stride_bytes + config.kv_scale_stride_bytes);
+        }
+    }
 
     return config;
 }

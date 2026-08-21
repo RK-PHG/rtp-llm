@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <cstdint>
@@ -24,11 +25,11 @@ struct NeedBlocksInfo {
 
 class KVCacheGroup {
 public:
-    KVCacheGroup(const LayerIdsType& layer_ids,
-                 KVCacheSpecPtr      kvcache_spec,
-                 BlockPoolPtr        block_pool,
-                 int                 group_id,
-                 SharedBlockCache*   shared_cache = nullptr,
+    KVCacheGroup(const LayerIdsType&                 layer_ids,
+                 KVCacheSpecPtr                      kvcache_spec,
+                 BlockPoolPtr                        block_pool,
+                 int                                 group_id,
+                 SharedBlockCache*                   shared_cache     = nullptr,
                  const kmonitor::MetricsReporterPtr& metrics_reporter = nullptr):
         layer_ids_(layer_ids),
         kvcache_spec_(std::move(kvcache_spec)),
@@ -65,13 +66,37 @@ public:
     int    seqSizePerBlock() const;
     int    group_id() const;
 
+    // Cap this group's per-request block count. >0 means the group's KV cache is a
+    // ring of exactly that many blocks: a sliding-window layer only ever reads the
+    // last `window` tokens, so absolute position p lives at ring slot `p % window`,
+    // i.e. block `(p / seq_size_per_block) % ring_blocks`. The block list stops
+    // growing once it reaches the cap, which is what makes a windowed layer's cache
+    // footprint independent of sequence length.
+    //
+    // The model-input block table is still indexed by the absolute page number, so
+    // whoever flattens it repeats the ring across the row — see ring_block_table()
+    // on the Python side. 0 disables the cap (allocate the whole sequence).
+    void setRingBlocks(int ring_blocks) {
+        ring_blocks_ = std::max(ring_blocks, 0);
+    }
+    int ringBlocks() const {
+        return ring_blocks_;
+    }
+
 protected:
-    LayerIdsType      layer_ids_;
-    KVCacheSpecPtr    kvcache_spec_;
-    BlockPoolPtr      block_pool_;
-    SharedBlockCache* shared_cache_ = nullptr;
+    // Apply the ring cap to a would-be block count.
+    int capToRing(int blocks) const {
+        return ring_blocks_ > 0 ? std::min(blocks, ring_blocks_) : blocks;
+    }
+
+    int ring_blocks_ = 0;
+
+    LayerIdsType                 layer_ids_;
+    KVCacheSpecPtr               kvcache_spec_;
+    BlockPoolPtr                 block_pool_;
+    SharedBlockCache*            shared_cache_     = nullptr;
     kmonitor::MetricsReporterPtr metrics_reporter_ = nullptr;
-    int               group_id_     = 0;
+    int                          group_id_         = 0;
 
     int                                    seq_size_per_block_;
     std::unordered_map<int, torch::Tensor> global_layer_to_kv_tensors;

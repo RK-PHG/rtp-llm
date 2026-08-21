@@ -419,6 +419,7 @@ CacheLayerLayout KVCacheManager::getMainModelCacheLayerLayout() const {
     layout.group_types              = config_.group_types;
     layout.group_region_names       = config_.group_region_names;
     layout.group_seq_size_per_block = config_.group_seq_size_per_block;
+    layout.layer_local_kv_head_num  = all_layout.layer_local_kv_head_num;
     layout.layer_group_types.resize(config_.layer_num, CacheGroupType::FULL);
     layout.layers_to_kv_buffer_ptrs_by_attn.resize(config_.layer_num);
     if (!all_layout.layers_to_scale_buffer_ptrs_by_attn.empty()) {
@@ -657,7 +658,7 @@ KVCacheInfo KVCacheManager::buildKVCacheInfo(int64_t latest_version, bool need_c
         auto                      shared_cache = allocator_->sharedBlockCache();
         if (shared_cache) {
             device_cache_keys = shared_cache->allCacheKeys();
-            info.version = shared_cache->version();
+            info.version      = shared_cache->version();
         }
         // memory cache keys
         const auto mem_cache_keys = coordinator_->memoryCacheKeysForStatus();

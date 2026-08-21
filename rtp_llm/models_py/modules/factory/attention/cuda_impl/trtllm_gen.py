@@ -564,6 +564,11 @@ class FlashInferTRTLLMPrefillImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         fmha_impl = FlashInferTRTLLMPrefillOp(attn_configs)
         return fmha_impl.support(attn_inputs)
 
@@ -628,6 +633,11 @@ class FlashInferTRTLLMSpecDecodeImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         if attn_configs.use_mla:
             return False
         fmha_impl = FlashInferTRTLLMDecodeOp(attn_configs)
@@ -704,6 +714,11 @@ class FlashInferTRTLLMDecodeImpl(FMHAImplBase):
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        if (
+            attn_configs.v_size_per_head
+            and attn_configs.v_size_per_head != attn_configs.size_per_head
+        ):
+            return False
         if attn_configs.use_mla:
             return False
         fmha_impl = FlashInferTRTLLMDecodeOp(attn_configs)

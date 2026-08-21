@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//data1/renkun.ren/models/**)",
+      "Bash(/opt/conda310/bin/python3 -c ' *)",
+      "Bash(awk '/^## Step \\([0-9]\\)/{split\\($0,a,\\\\\"：\\\\\"\\);cur=a[1]} /^### [0-9]\\\\./{print cur\\\\\" \\\\\"$0}' mimo_v25_implementation_guide.md)"
+    ]
+  }
+}

@@ -25,6 +25,7 @@ from rtp_llm.utils.model_weight import (
     W,
     concat_0,
     identity,
+    is_mimo_v25_weight,
     is_v4_weight,
     merge_block_scale,
     merge_te_qkv,
@@ -278,6 +279,12 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
         # (V4PerBlockFp8Weight) — keep the base class out of contention so the
         # registry's "must be exactly one match" check passes.
         if is_v4_weight(src_weight_info):
+            return False
+        # MiMo V2.5 marked weights are dispatched to the MiMo-specific
+        # subclass (MiMoPerBlockFp8Weight in models/mimo_v25_weight.py) —
+        # its fused-qkv ckpt layout (single tensor) and BF16 o_proj do not
+        # fit the base class's 3-tensor merge_te_qkv assumption.
+        if is_mimo_v25_weight(src_weight_info):
             return False
         return True
 
