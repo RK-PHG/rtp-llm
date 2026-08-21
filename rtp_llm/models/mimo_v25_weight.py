@@ -17,7 +17,7 @@
 # not registered in this file; the loader filters the ckpt against the registered list, so
 # they are excluded naturally.
 import functools
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -90,12 +90,6 @@ SLAB_LAYOUT: Dict[int, Dict[str, int]] = {
     },
 }
 
-# attention_value_scale: the reference implementation multiplies V by 0.707 uniformly
-# across all 48 layers. Since 0.707*(softmax(QK)*V) == (softmax(QK)*V)*0.707, the factor
-# can safely be hoisted into o_proj: o_proj_new = 0.707 * o_proj_orig. It is folded into
-# o_proj's BF16 weight at load time.
-ATTENTION_VALUE_SCALE = 0.707
-
 
 def check_qkv_scale_rows(s: torch.Tensor, kv_heads: int) -> None:
     """Check that the total scale row count == slab_scale_rows * 4, so that a ckpt with a
@@ -134,13 +128,21 @@ def _tp_bypass(load_config: LoadConfig) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _transpose_with_value_scale(ts: List[torch.Tensor]) -> torch.Tensor:
-    """Post-load processing for o_proj: transpose first, then multiply by
-    ATTENTION_VALUE_SCALE.
+def _transpose_with_value_scale(
+    ts: List[torch.Tensor], value_scale: Optional[float]
+) -> torch.Tensor:
+    """Post-load processing for o_proj: transpose, then fold in attention_value_scale.
 
-    value_scale is folded here into the o_proj BF16 weight of all 48 layers uniformly; the
-    qkv path is unaffected."""
-    return ts[0].t().contiguous() * ATTENTION_VALUE_SCALE
+    ``value_scale`` is whatever the ckpt's config.json carries (parsed in mimo_v25.py); the
+    factor is never assumed here. The reference implementation scales V in every layer
+    before the KV cache is written, and attention is linear in V, so
+    ``s*(softmax(QK)*V)*W_o == (softmax(QK)*V)*(s*W_o)`` -- folding it into o_proj's BF16
+    weight keeps the qkv path free of float-domain work and lets the FP8 weights be sliced
+    as-is.
+
+    None means the ckpt does not scale V, so the weight is only transposed."""
+    w = ts[0].t().contiguous()
+    return w if value_scale is None else w * value_scale
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +334,9 @@ class MiMoV25Weight(ModelDeployWeightInfo):
         super().__init__(**kwargs)
         # QK=192 / V=128
         self._v_size_per_head = self.model_config.attn_config.v_size_per_head
+        # Folded into o_proj below. Comes from the ckpt's config.json via
+        # MiMoV25._parse_basic_config; None there means the ckpt does not scale V.
+        self._attention_value_scale = self.model_config.attention_value_scale
 
     def _process_meta(self, meta_dicts: Any, weight_keys: List[str]):
         self.transformer_prefix = self.prefix + self.model_prefix
@@ -412,7 +417,7 @@ class MiMoV25Weight(ModelDeployWeightInfo):
                 config=attn_config,
             ),
             # o_proj: BF16 (in ignored_layers, no scale), input dim 64*128=8192, taking the
-            # unquantized path. The 0.707 value_scale is folded in here.
+            # unquantized path. The ckpt's attention_value_scale is folded in here.
             MiMoBf16AtomicWeight(
                 W.attn_o_w,
                 [
@@ -420,7 +425,10 @@ class MiMoV25Weight(ModelDeployWeightInfo):
                         self.transformer_prefix + "layers.{i}.self_attn.o_proj.weight"
                     )
                 ],
-                _transpose_with_value_scale,
+                functools.partial(
+                    _transpose_with_value_scale,
+                    value_scale=self._attention_value_scale,
+                ),
             ),
             AtomicWeight(
                 W.post_ln_gamma,

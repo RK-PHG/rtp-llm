@@ -43,7 +43,7 @@ MiMo-V2.5 是 48 层 MoE omni 模型。与框架既有模型相比，有 **7 个
 
 5. **Attention sink**。仅 SWA 层带一个 per-head 可学习标量 `attention_sink_bias`（BF16，形状 `[64]`），作为额外一列 logit 参与 softmax 分母、输出时丢弃。GA 层没有。
 
-6. **attention_value_scale**。参考实现对所有 48 层的 V 统一乘 0.707，且发生在写 KV cache **之前**。
+6. **attention_value_scale**。参考实现对所有 48 层的 V 统一乘 `config.json` 里的 `attention_value_scale`（本 ckpt 0.707），且发生在写 KV cache **之前**。
 
 7. **FP8 融合 QKV 是 slab-interleaved**。ckpt 里 Q/K/V 是单个 `qkv_proj.weight` 张量，且沿行方向被切成 4 个独立量化的 slab；`o_proj` 是 BF16（在 `quantization_config.ignored_layers` 里）。
 
@@ -189,13 +189,15 @@ new_scale  = scale_inv[tp_rank * slab_scale_rows : (tp_rank + 1) * slab_scale_ro
 
 ### 3.3 attention_value_scale 折进 o_proj
 
-参考实现里 `value_states = value_states * 0.707` 发生在写 KV cache 之前，作用于所有 48 层。因为 attention 对 V 是线性的：
+参考实现里 `value_states = value_states * s` 发生在写 KV cache 之前，作用于所有 48 层。因为 attention 对 V 是线性的：
 
 ```
-0.707 · (softmax(QKᵀ) · V) · W_o  ==  (softmax(QKᵀ) · V) · (0.707 · W_o)
+s · (softmax(QKᵀ) · V) · W_o  ==  (softmax(QKᵀ) · V) · (s · W_o)
 ```
 
 所以外提到 `o_proj` 完全等价。`_transpose_with_value_scale()` 在加载时把它折进 `o_proj` 的 BF16 权重。这样做的好处是 qkv 路径完全不涉及 float 域操作，FP8 权重可以原样切片（§3.2）。
+
+因子 `s` 由 `_parse_basic_config()` 从 ckpt 的 `config.json` 读 `attention_value_scale`（本 ckpt 0.707），经 `ModelConfig.attention_value_scale` 传给权重加载，代码里不留常量 —— 换一个因子不同的 ckpt 会被跟随，而不是静默按旧值重缩放。字段缺失时为 `None`，表示该 ckpt 不缩放 V，`o_proj` 只做转置：`configuration_mimo_v2.py` 的默认值就是 `None`，参考实现也只在它非空时才乘。非正数或非数值会在解析阶段断言失败。
 
 > 前提是 `o_proj` 为 BF16。若将来 ckpt 把 `o_proj` 也量化，这个折叠会变成量化误差来源。
 

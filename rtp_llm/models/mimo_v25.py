@@ -63,6 +63,24 @@ class MiMoV25(BaseModel):
         # The weight mapping splits a single fused-qkv tensor
         assert cj.get("attention_projection_layout") == "fused_qkv"
 
+        # V is scaled by this factor before the KV cache is written, in every layer. The
+        # weight loader folds it into o_proj instead (mimo_v25_weight.py), which is
+        # equivalent because attention is linear in V. None means the ckpt does not scale V
+        # at all: configuration_mimo_v2.py defaults attention_value_scale to None and the
+        # reference implementation multiplies only when it is set. Read from the ckpt rather
+        # than assumed, so a ckpt with a different factor is followed instead of silently
+        # rescaled.
+        value_scale = cj.get("attention_value_scale")
+        assert value_scale is None or (
+            isinstance(value_scale, (int, float))
+            and not isinstance(value_scale, bool)
+            and value_scale > 0
+        ), (
+            "attention_value_scale must be a positive number or absent, "
+            f"got {value_scale!r}"
+        )
+        config.attention_value_scale = value_scale
+
     @classmethod
     def _parse_stop_words(cls, ckpt_path: str, config: ModelConfig):
         # The eos in generation_config.json is usually a list (three entries in this ckpt)

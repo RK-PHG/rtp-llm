@@ -85,6 +85,7 @@ class ModelConfig(CppModelConfig):
         "phy2log_path",
         "lora_infos",
         "headwise_config",
+        "attention_value_scale",
     }
 
     # Known C++ ModelConfig members (from ModelConfig.h)
